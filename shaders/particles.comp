@@ -1,0 +1,150 @@
+#version 460
+// Particle simulation kernel.
+//
+// Two operating modes selected by push constant `mode`:
+//  mode = 0  initialization: rejection sample positions from |psi(r)|^2
+//            stored in the wavefunction volume, populating the particle SSBO.
+//  mode = 1  update: advance every particle by one timestep along the
+//            probability current j = (hbar/m_e) Im(psi^* grad psi).
+//
+// The particle state is a single vec4 per particle: xyz = position in Bohr
+// radii, w = an "age" counter used for re-seeding tired particles that
+// drift into low-density regions.
+
+layout(local_size_x = 64) in;
+
+struct Particle {
+    vec4 pos_age;
+};
+
+layout(set = 0, binding = 0, std430) buffer Particles {
+    Particle particles[];
+};
+
+layout(set = 0, binding = 1) uniform sampler3D psiTex;
+
+layout(push_constant) uniform PC {
+    float halfExtent;     // domain half size in Bohr
+    float maxDensity;     // upper bound on |psi|^2 used by rejection sampler
+    float voxelSize;      // h, used for finite-difference gradient
+    float dt;             // integration timestep in atomic units
+    uint  mode;           // 0 = init, 1 = update
+    uint  seed;           // per-frame RNG seed (frame counter)
+    uint  numParticles;   // total particle count (for bounds checking)
+    uint  _pad;
+} pc;
+
+// Cheap, decent quality hash-based RNG (PCG-style) 
+uint pcg_hash(uint x) {
+    uint state = x * 747796405u + 2891336453u;
+    uint word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+float rnd(inout uint state) {
+    state = pcg_hash(state);
+    return float(state) / 4294967296.0;
+}
+
+vec2 sample_psi(vec3 worldPos) {
+    vec3 uvw = (worldPos + vec3(pc.halfExtent)) / (2.0 * pc.halfExtent);
+    if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0))))
+        return vec2(0.0);
+    return texture(psiTex, uvw).rg;
+}
+
+float density_at(vec3 worldPos) {
+    vec2 psi = sample_psi(worldPos);
+    return dot(psi, psi);
+}
+
+// Try at most N attempts to find a position whose density passes the
+// rejection test. Returns vec4(pos, 1.0) on success, vec4(0,0,0, -1) on
+// failure so the caller can mark the particle as a placeholder.
+vec4 rejection_sample(inout uint rng) {
+    for (int tries = 0; tries < 64; ++tries) {
+        vec3 pos = vec3(
+            (rnd(rng) * 2.0 - 1.0) * pc.halfExtent,
+            (rnd(rng) * 2.0 - 1.0) * pc.halfExtent,
+            (rnd(rng) * 2.0 - 1.0) * pc.halfExtent
+        );
+        float d = density_at(pos);
+        if (rnd(rng) * pc.maxDensity < d) {
+            return vec4(pos, 1.0);
+        }
+    }
+    // Could not sample; return a hidden position (large radius, age = -1).
+    return vec4(0.0, 0.0, 0.0, -1.0);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.numParticles) return;
+
+    uint rng = pcg_hash(id ^ (pc.seed * 1664525u));
+
+    if (pc.mode == 0u) {
+        // Initialization: rejection sample from |psi|^2 
+        particles[id].pos_age = rejection_sample(rng);
+        return;
+    }
+
+    // Update: probability current advection 
+    vec4 state = particles[id].pos_age;
+    vec3 p = state.xyz;
+    float age = state.w;
+
+    // Re-seed dead or extremely-low-density particles so the cloud stays
+    // populated as the wavefunction evolves.
+    if (age < 0.0 || density_at(p) < pc.maxDensity * 1e-4) {
+        particles[id].pos_age = rejection_sample(rng);
+        return;
+    }
+
+    // Probability current j = (hbar / m_e) Im(psi^* grad psi) 
+    // Atomic units: hbar = m_e = 1, so j = Im(psi^* grad psi).
+    // grad psi by central differences of the complex texture.
+    float h = pc.voxelSize;
+    vec2 px = sample_psi(p + vec3(h, 0, 0));
+    vec2 mx = sample_psi(p - vec3(h, 0, 0));
+    vec2 py = sample_psi(p + vec3(0, h, 0));
+    vec2 my = sample_psi(p - vec3(0, h, 0));
+    vec2 pz = sample_psi(p + vec3(0, 0, h));
+    vec2 mz = sample_psi(p - vec3(0, 0, h));
+
+    vec2 gx = (px - mx) / (2.0 * h);
+    vec2 gy = (py - my) / (2.0 * h);
+    vec2 gz = (pz - mz) / (2.0 * h);
+
+    vec2 psi = sample_psi(p);
+    float rho = dot(psi, psi);
+    if (rho < 1e-12) {
+        particles[id].pos_age = rejection_sample(rng);
+        return;
+    }
+
+    // Im(psi^* grad psi) for each component.
+    // psi^* = (re, -im); psi^* * grad = (re*gx - (-im)*gy_im) ... no:
+    // For complex multiplication: (a - i b)(c + i d) = (ac + bd) + i(ad - bc),
+    // so Im = a*d - b*c where psi = a + i b, grad = c + i d.
+    float jx = psi.x * gx.y - psi.y * gx.x;
+    float jy = psi.x * gy.y - psi.y * gy.x;
+    float jz = psi.x * gz.y - psi.y * gz.x;
+    vec3 j = vec3(jx, jy, jz);
+
+    // Velocity field v = j / rho (Madelung). Cap to keep particles stable
+    // if they drift through a near-zero density region.
+    vec3 vel = j / rho;
+    float vmag = length(vel);
+    float vmax = 5.0;                  // Bohr per atomic time unit, soft cap
+    if (vmag > vmax) vel *= vmax / vmag;
+
+    p += vel * pc.dt;
+
+    // Reflect / re-seed if the particle leaves the simulation domain.
+    if (any(greaterThan(abs(p), vec3(pc.halfExtent)))) {
+        particles[id].pos_age = rejection_sample(rng);
+        return;
+    }
+
+    particles[id].pos_age = vec4(p, age + pc.dt);
+}

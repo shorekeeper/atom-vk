@@ -1,0 +1,143 @@
+#version 460
+// Time-dependent quantum simulation kernel.
+//
+// Evaluates a coherent superposition of hydrogenic eigenstates
+//
+//    psi(r, t) = sum_k (c_k_real + i c_k_imag) * psi_nlm_k(r)
+//                      * exp(-i E_k t)
+//
+// at each voxel, and stores the complex value (real, imaginary) into the
+// volume image. The squared modulus and the phase are reconstructed by the
+// fragment shader.
+//
+// Pure stationary states correspond to a single component and produce a
+// time-independent |psi|^2. Superpositions of states with distinct energies
+// produce visible probability density oscillations at the Bohr frequencies
+// omega = (E_k - E_k')/hbar. In atomic units hbar = 1 so omega = E_k - E_k'.
+//
+// All math runs in atomic units: lengths in Bohr radii, energies in Hartree.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(set = 0, binding = 0, rg32f) uniform image3D psiImage;
+
+#define MAX_COMPONENTS 8
+
+layout(set = 0, binding = 1) uniform Components {
+    int   numComponents;
+    int   gridSize;
+    float halfExtent;
+    float time;
+    // n, l, m packed as floats; w holds Z (nuclear charge).
+    vec4  nlmZ[MAX_COMPONENTS];
+    // x = c_real, y = c_imag, z = energy E_k (Hartree), w = padding.
+    vec4  amp [MAX_COMPONENTS];
+} cb;
+
+const float PI = 3.14159265358979323846;
+
+float factorial(int n) {
+    float f = 1.0;
+    for (int i = 2; i <= n; ++i) f *= float(i);
+    return f;
+}
+
+// L_n^alpha(x) by stable forward three-term recurrence.
+float laguerre(int n, int alpha, float x) {
+    if (n == 0) return 1.0;
+    float a = 1.0;
+    float b = 1.0 + float(alpha) - x;
+    if (n == 1) return b;
+    for (int k = 1; k < n; ++k) {
+        float kf = float(k);
+        float c = ((2.0*kf + float(alpha) + 1.0 - x) * b
+                  - (kf + float(alpha)) * a) / (kf + 1.0);
+        a = b;
+        b = c;
+    }
+    return b;
+}
+
+// P_l^m(x), m >= 0, with Condon-Shortley phase. Stable diagonal seed.
+float legendre(int l, int m, float x) {
+    float pmm = 1.0;
+    if (m > 0) {
+        float omx2 = max(1.0 - x*x, 0.0);
+        pmm *= exp(0.5 * float(m) * log(omx2 + 1e-30));
+        float df = 1.0;
+        for (int i = 1; i <= m; ++i) df *= float(2*i - 1);
+        pmm *= ((m & 1) == 1 ? -1.0 : 1.0) * df;
+    }
+    if (l == m) return pmm;
+    float pmmp1 = x * float(2*m + 1) * pmm;
+    if (l == m + 1) return pmmp1;
+    float pll = 0.0;
+    for (int ll = m + 2; ll <= l; ++ll) {
+        pll = (float(2*ll - 1) * x * pmmp1 - float(ll + m - 1) * pmm)
+              / float(ll - m);
+        pmm = pmmp1;
+        pmmp1 = pll;
+    }
+    return pll;
+}
+
+// Real spherical harmonic: produces standard p_x, p_y, p_z, d_xy ... lobes.
+float realY(int l, int m, float theta, float phi) {
+    int absM = abs(m);
+    float p = legendre(l, absM, cos(theta));
+    float norm = sqrt((2.0*float(l) + 1.0) / (4.0*PI)
+                    * factorial(l - absM) / factorial(l + absM));
+    if      (m > 0) return sqrt(2.0) * norm * p * cos(float(absM) * phi);
+    else if (m < 0) return sqrt(2.0) * norm * p * sin(float(absM) * phi);
+    else            return            norm * p;
+}
+
+// Hydrogenic radial function R_nl(r).
+float radial(int n, int l, float Z, float r) {
+    float rho = 2.0 * Z * r / float(n);
+    float norm = sqrt(pow(2.0*Z/float(n), 3.0)
+                    * factorial(n - l - 1)
+                    / (2.0*float(n) * factorial(n + l)));
+    return norm * exp(-Z*r/float(n)) * pow(rho, float(l))
+                * laguerre(n - l - 1, 2*l + 1, rho);
+}
+
+void main() {
+    ivec3 idx = ivec3(gl_GlobalInvocationID);
+    int N = cb.gridSize;
+    if (any(greaterThanEqual(idx, ivec3(N)))) return;
+
+    // Voxel center in physical coordinates (Bohr radii).
+    vec3 voxF = vec3(idx) + vec3(0.5);
+    vec3 pos  = (voxF / float(N)) * 2.0 * cb.halfExtent - vec3(cb.halfExtent);
+
+    float r = length(pos);
+    float theta = r > 1e-8 ? acos(clamp(pos.z / r, -1.0, 1.0)) : 0.0;
+    float phi   = atan(pos.y, pos.x);
+
+    // Accumulate complex superposition.
+    vec2 psi = vec2(0.0);
+    for (int k = 0; k < cb.numComponents; ++k) {
+        int   n = int(cb.nlmZ[k].x);
+        int   l = int(cb.nlmZ[k].y);
+        int   m = int(cb.nlmZ[k].z);
+        float Z = cb.nlmZ[k].w;
+        float cR = cb.amp[k].x;
+        float cI = cb.amp[k].y;
+        float E  = cb.amp[k].z;
+
+        float Rnl = radial(n, l, Z, r);
+        float Ylm = realY(l, m, theta, phi);
+        float psiK = Rnl * Ylm;   // real-valued eigenstate
+
+        // (c_real + i c_imag) * exp(-i E t)
+        //  = (c_real cos(Et) + c_imag sin(Et))
+        //  + i (c_imag cos(Et) - c_real sin(Et))
+        float c = cos(E * cb.time);
+        float s = sin(E * cb.time);
+        psi.x += (cR * c + cI * s) * psiK;
+        psi.y += (cI * c - cR * s) * psiK;
+    }
+
+    imageStore(psiImage, idx, vec4(psi, 0.0, 0.0));
+}
