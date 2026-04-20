@@ -56,14 +56,18 @@ const VK_1: usize = 0x31;
 const VK_OEM_PLUS:  usize = 0xBB;
 const VK_OEM_MINUS: usize = 0xBD;
 const VK_SPACE: usize = 0x20;
-const VK_V: usize = 0x56; // toggle View mode
-const VK_S: usize = 0x53; // cycle Slice axis
-const VK_C: usize = 0x43; // cycle Color mode
-const VK_X: usize = 0x58; // toggle Contour overlay
-const VK_P: usize = 0x50;  // toggle Particles
-const VK_W: usize = 0x57;  // toggle Waves
-const VK_B: usize = 0x42;  // toggle volume rendering (Background cloud)
-const VK_E: usize = 0x45;  // Emit a wave from origin
+const VK_V: usize = 0x56;
+const VK_S: usize = 0x53;
+const VK_C: usize = 0x43;
+const VK_X: usize = 0x58;
+const VK_P: usize = 0x50;
+const VK_W: usize = 0x57;
+const VK_B: usize = 0x42;
+const VK_E: usize = 0x45;
+// Perf toggles: T toggles the mipmap empty-space skip in the volume
+// raymarcher; N toggles async compute queue submission.
+const VK_T: usize = 0x54;
+const VK_N: usize = 0x4E;
 const VK_LEFT_KEY:  usize = 0x25;
 const VK_RIGHT_KEY: usize = 0x27;
 
@@ -78,7 +82,6 @@ fn main() {
 
     let start = Instant::now();
     while window.pump() {
-        // Preset hotkeys.
         for i in 0..all.len().min(9) {
             if window.consume_key(VK_1 + i) {
                 current = i;
@@ -93,8 +96,6 @@ fn main() {
             renderer.time_scale = (renderer.time_scale / 1.5).max(0.05);
             println!("time_scale = {:.2} a.u./s", renderer.time_scale);
         }
-
-        // Camera and view-mode keys.
         if window.consume_key(VK_SPACE) {
             renderer.auto_orbit = !renderer.auto_orbit;
             println!("auto_orbit = {}", renderer.auto_orbit);
@@ -105,39 +106,34 @@ fn main() {
                 ViewMode::Volume => "Volume", ViewMode::Heatmap => "Heatmap",
             });
         }
-        if window.consume_key(VK_S) {
-            renderer.cycle_slice_axis();
-        }
-        if window.consume_key(VK_C) {
-            renderer.cycle_color_mode();
-        }
-        if window.consume_key(VK_X) {
-            renderer.show_contour = !renderer.show_contour;
-        }
+        if window.consume_key(VK_S) { renderer.cycle_slice_axis(); }
+        if window.consume_key(VK_C) { renderer.cycle_color_mode(); }
+        if window.consume_key(VK_X) { renderer.show_contour = !renderer.show_contour; }
         if window.consume_key(VK_P) {
             renderer.show_particles = !renderer.show_particles;
             if renderer.show_particles { renderer.request_particle_reseed(); }
             println!("particles = {}", renderer.show_particles);
         }
-        if window.consume_key(VK_W) {
-            renderer.show_waves = !renderer.show_waves;
-        }
-        if window.consume_key(VK_B) {
-            renderer.show_volume = !renderer.show_volume;
-        }
+        if window.consume_key(VK_W) { renderer.show_waves = !renderer.show_waves; }
+        if window.consume_key(VK_B) { renderer.show_volume = !renderer.show_volume; }
         if window.consume_key(VK_E) {
-            // Emit a wave from origin: yellow shell of one Bohr per second, max 30 Bohr.
             renderer.emit_wave([0.0, 0.0, 0.0], [1.0, 1.0, 0.2], 30.0, 12.0);
         }
-        if window.consume_key(VK_LEFT_KEY) {
-            renderer.nudge_slice(-0.05);
+        if window.consume_key(VK_T) {
+            renderer.toggle_perf_mipskip();
+            println!("perf_mipskip = {}", renderer.perf_mipskip);
         }
-        if window.consume_key(VK_RIGHT_KEY) {
-            renderer.nudge_slice(0.05);
+        if window.consume_key(VK_N) {
+            if !renderer.caps.has_async_compute() {
+                println!("async compute not supported on this adapter");
+            } else {
+                renderer.toggle_perf_async();
+                println!("perf_async = {}", renderer.perf_async);
+            }
         }
+        if window.consume_key(VK_LEFT_KEY)  { renderer.nudge_slice(-0.05); }
+        if window.consume_key(VK_RIGHT_KEY) { renderer.nudge_slice( 0.05); }
 
-        // Mouse: LMB drag rotates, wheel zooms. Disables auto-orbit on drag
-        // so the user can hold their viewpoint.
         let mouse = window.poll_mouse();
         if mouse.left && (mouse.dx != 0.0 || mouse.dy != 0.0) {
             renderer.auto_orbit = false;
@@ -172,5 +168,8 @@ fn print_help() {
     println!("C          : cycle color mode (density / real / phase) [heatmap]");
     println!("X          : toggle zero-contour overlay [heatmap, real mode]");
     println!("Left/Right : scrub slice depth [heatmap]");
+    println!("T          : toggle mipmap empty-space skip (perf)");
+    println!("N          : toggle async compute queue (perf)");
+    println!("P/W/B/E    : particles / waves / volume / emit wave");
     println!("Esc        : quit");
 }

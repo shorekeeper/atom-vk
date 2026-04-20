@@ -1,0 +1,49 @@
+#version 460
+// Min-max (well, max-only) mipmap construction for empty-space skipping
+// in the volume ray marcher.
+//
+// Each invocation owns one coarse voxel of dimension blockSize^3 in the
+// fine grid. It samples the fine |psi|^2 volume across that block plus
+// a one-voxel halo (so trilinear lookups near the cell boundary cannot
+// produce density that was never accounted for) and writes the maximum
+// density found to the coarse image. The renderer consults this image
+// as a DDA occupancy structure: when a coarse cell's max density is
+// below the opacity threshold, the whole cell contributes nothing and
+// the ray jumps to its exit plane in a single step instead of taking
+// blockSize regular steps through provably empty space.
+//
+// At GRID_SIZE=128 and COARSE_GRID_SIZE=16 this reduces one coarse
+// voxel to a single coarse sample instead of 8^3=512 fine samples.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0) uniform sampler3D psiTex;
+layout(set = 0, binding = 1, r32f) uniform image3D maxImage;
+
+layout(push_constant) uniform PC {
+    int fineGridSize;
+    int coarseGridSize;
+    int blockSize;
+    int _pad;
+} pc;
+
+void main() {
+    ivec3 coarse = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(coarse, ivec3(pc.coarseGridSize)))) return;
+
+    ivec3 base = coarse * pc.blockSize;
+    float maxDensity = 0.0;
+
+    for (int z = -1; z <= pc.blockSize; ++z)
+    for (int y = -1; y <= pc.blockSize; ++y)
+    for (int x = -1; x <= pc.blockSize; ++x) {
+        ivec3 f = base + ivec3(x, y, z);
+        if (any(lessThan(f, ivec3(0))) ||
+            any(greaterThanEqual(f, ivec3(pc.fineGridSize)))) continue;
+        vec3 uvw = (vec3(f) + 0.5) / float(pc.fineGridSize);
+        vec2 psi = texture(psiTex, uvw).rg;
+        float d  = dot(psi, psi);
+        if (d > maxDensity) maxDensity = d;
+    }
+    imageStore(maxImage, coarse, vec4(maxDensity));
+}

@@ -27,6 +27,9 @@ fn main() {
         ("particles.frag",    "particles.frag.spv"),
         ("waves.vert",        "waves.vert.spv"),
         ("waves.frag",        "waves.frag.spv"),
+        ("text.frag",         "text.frag.spv"),
+        ("text.vert",         "text.vert.spv"),
+        ("mipmap.comp",       "mipmap.comp.spv"),
     ];
 
     for (src, dst) in shaders.iter() {
