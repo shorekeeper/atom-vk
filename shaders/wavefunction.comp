@@ -30,7 +30,8 @@ layout(set = 0, binding = 1) uniform Components {
     float time;
     // n, l, m packed as floats; w holds Z (nuclear charge).
     vec4  nlmZ[MAX_COMPONENTS];
-    // x = c_real, y = c_imag, z = energy E_k (Hartree), w = padding.
+    // x = c_real, y = c_imag, z = energy E_k (Hartree)
+    // w = angular basis (0=real tesseral, 1=complex spherical)
     vec4  amp [MAX_COMPONENTS];
 } cb;
 
@@ -81,7 +82,7 @@ float legendre(int l, int m, float x) {
     return pll;
 }
 
-// Real spherical harmonic: produces standard p_x, p_y, p_z, d_xy ... lobes.
+// Returns a normalized real tesseral harmonic.
 float realY(int l, int m, float theta, float phi) {
     int absM = abs(m);
     float p = legendre(l, absM, cos(theta));
@@ -89,7 +90,20 @@ float realY(int l, int m, float theta, float phi) {
                     * factorial(l - absM) / factorial(l + absM));
     if      (m > 0) return sqrt(2.0) * norm * p * cos(float(absM) * phi);
     else if (m < 0) return sqrt(2.0) * norm * p * sin(float(absM) * phi);
-    else            return            norm * p;
+    else            return norm * p;
+}
+
+// Returns Y_l^m(theta, phi) as vec2(real, imaginary).
+// The associated Legendre function includes the Condon-Shortley phase.
+vec2 complexY(int l, int m, float theta, float phi) {
+    int absM = abs(m);
+    float p = legendre(l, absM, cos(theta));
+    float norm = sqrt((2.0*float(l) + 1.0) / (4.0*PI)
+                    * factorial(l - absM) / factorial(l + absM));
+    float negativeMPhase =
+        (m < 0 && (absM & 1) == 1) ? -1.0 : 1.0;
+    float angle = float(m) * phi;
+    return negativeMPhase * norm * p * vec2(cos(angle), sin(angle));
 }
 
 // Hydrogenic radial function R_nl(r).
@@ -115,28 +129,31 @@ void main() {
     float theta = r > 1e-8 ? acos(clamp(pos.z / r, -1.0, 1.0)) : 0.0;
     float phi   = atan(pos.y, pos.x);
 
-    // Accumulate complex superposition.
+    // Accumulate the complex superposition.
     vec2 psi = vec2(0.0);
     for (int k = 0; k < cb.numComponents; ++k) {
-        int   n = int(cb.nlmZ[k].x);
-        int   l = int(cb.nlmZ[k].y);
-        int   m = int(cb.nlmZ[k].z);
+        int n = int(cb.nlmZ[k].x);
+        int l = int(cb.nlmZ[k].y);
+        int m = int(cb.nlmZ[k].z);
         float Z = cb.nlmZ[k].w;
         float cR = cb.amp[k].x;
         float cI = cb.amp[k].y;
-        float E  = cb.amp[k].z;
+        float E = cb.amp[k].z;
+        int basis = int(cb.amp[k].w + 0.5);
 
         float Rnl = radial(n, l, Z, r);
-        float Ylm = realY(l, m, theta, phi);
-        float psiK = Rnl * Ylm;   // real-valued eigenstate
+        vec2 angular = basis == 0
+            ? vec2(realY(l, m, theta, phi), 0.0)
+            : complexY(l, m, theta, phi);
+        vec2 orbital = Rnl * angular;
 
-        // (c_real + i c_imag) * exp(-i E t)
-        //  = (c_real cos(Et) + c_imag sin(Et))
-        //  + i (c_imag cos(Et) - c_real sin(Et))
         float c = cos(E * cb.time);
         float s = sin(E * cb.time);
-        psi.x += (cR * c + cI * s) * psiK;
-        psi.y += (cI * c - cR * s) * psiK;
+        vec2 coefficient = vec2(cR*c + cI*s, cI*c - cR*s);
+        psi += vec2(
+            coefficient.x*orbital.x - coefficient.y*orbital.y,
+            coefficient.x*orbital.y + coefficient.y*orbital.x
+        );
     }
 
     imageStore(psiImage, idx, vec4(psi, 0.0, 0.0));

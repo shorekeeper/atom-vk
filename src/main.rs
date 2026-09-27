@@ -3,7 +3,7 @@ mod vulkan;
 
 use std::time::Instant;
 use win32::Window;
-use vulkan::{VulkanRenderer, OrbitalComponent, ViewMode};
+use vulkan::{AngularBasis, OrbitalComponent, ViewMode, VulkanRenderer};
 
 fn energy(n: i32, z: f32) -> f32 { -(z*z) / (2.0 * (n*n) as f32) }
 
@@ -12,7 +12,14 @@ fn pure(n: i32, l: i32, m: i32) -> Vec<OrbitalComponent> {
         n, l, m, z: 1.0,
         c_real: 1.0, c_imag: 0.0,
         energy: energy(n, 1.0),
+        basis: AngularBasis::Real,
     }]
+}
+
+fn complex_pure(n: i32, l: i32, m: i32) -> Vec<OrbitalComponent> {
+    let mut components = pure(n, l, m);
+    components[0].basis = AngularBasis::Complex;
+    components
 }
 
 fn superposition(
@@ -22,11 +29,15 @@ fn superposition(
     vec![
         OrbitalComponent {
             n: a.0, l: a.1, m: a.2, z: 1.0,
-            c_real: inv_sqrt2, c_imag: 0.0, energy: energy(a.0, 1.0),
+            c_real: inv_sqrt2, c_imag: 0.0,
+            energy: energy(a.0, 1.0),
+            basis: AngularBasis::Real,
         },
         OrbitalComponent {
             n: b.0, l: b.1, m: b.2, z: 1.0,
-            c_real: inv_sqrt2, c_imag: 0.0, energy: energy(b.0, 1.0),
+            c_real: inv_sqrt2, c_imag: 0.0,
+            energy: energy(b.0, 1.0),
+            basis: AngularBasis::Real,
         },
     ]
 }
@@ -34,25 +45,40 @@ fn superposition(
 struct Preset {
     name: &'static str,
     components: Vec<OrbitalComponent>,
-    max_density: f32,
 }
 
 fn presets() -> Vec<Preset> {
     vec![
-        Preset { name: "1s ground state",            components: pure(1,0,0), max_density: 0.30 },
-        Preset { name: "2s (radial node)",           components: pure(2,0,0), max_density: 0.04 },
-        Preset { name: "2p_z",                        components: pure(2,1,0), max_density: 0.015 },
-        Preset { name: "3d_z^2",                      components: pure(3,2,0), max_density: 0.004 },
-        Preset { name: "3d_xy",                       components: pure(3,2,-2),max_density: 0.004 },
-        Preset { name: "Oscillating 1s+2p_z",        components: superposition((1,0,0),(2,1,0)), max_density: 0.10 },
-        Preset { name: "Breathing 1s+2s",             components: superposition((1,0,0),(2,0,0)), max_density: 0.15 },
-        Preset { name: "Rabi 2p_z+3d_z^2",            components: superposition((2,1,0),(3,2,0)), max_density: 0.010 },
-        Preset { name: "4f (n=4,l=3,m=0)",           components: pure(4,3,0), max_density: 0.0010 },
+        Preset { name: "1s ground state", components: pure(1,0,0) },
+        Preset { name: "2s (radial node)", components: pure(2,0,0) },
+        Preset { name: "2p_z", components: pure(2,1,0) },
+        Preset { name: "3d_z^2", components: pure(3,2,0) },
+        Preset { name: "3d_xy", components: pure(3,2,-2) },
+        Preset {
+            name: "Oscillating 1s+2p_z",
+            components: superposition((1,0,0),(2,1,0)),
+        },
+        Preset {
+            name: "Breathing 1s+2s",
+            components: superposition((1,0,0),(2,0,0)),
+        },
+        Preset {
+            name: "Rabi 2p_z+3d_z^2",
+            components: superposition((2,1,0),(3,2,0)),
+        },
+        Preset { name: "4f (n=4,l=3,m=0)", components: pure(4,3,0) },
+        Preset {
+            name: "Complex 2p (n=2,l=1,m=+1)",
+            components: complex_pure(2,1,1),
+        },
     ]
 }
 
 // Virtual key codes.
+const VK_0: usize = 0x30;
 const VK_1: usize = 0x31;
+const VK_G: usize = 0x47;
+const VK_K: usize = 0x4B;
 const VK_OEM_PLUS:  usize = 0xBB;
 const VK_OEM_MINUS: usize = 0xBD;
 const VK_SPACE: usize = 0x20;
@@ -88,6 +114,10 @@ fn main() {
                 apply_preset(&mut renderer, &all[current]);
             }
         }
+        if all.len() > 9 && window.consume_key(VK_0) {
+            current = 9;
+            apply_preset(&mut renderer, &all[current]);
+        }
         if window.consume_key(VK_OEM_PLUS) {
             renderer.time_scale = (renderer.time_scale * 1.5).min(50.0);
             println!("time_scale = {:.2} a.u./s", renderer.time_scale);
@@ -108,6 +138,11 @@ fn main() {
         }
         if window.consume_key(VK_S) { renderer.cycle_slice_axis(); }
         if window.consume_key(VK_C) { renderer.cycle_color_mode(); }
+        if window.consume_key(VK_G) { renderer.cycle_heatmap_scale(); }
+        if window.consume_key(VK_K) {
+            renderer.toggle_angular_basis();
+            println!("angular basis toggled");
+        }
         if window.consume_key(VK_X) { renderer.show_contour = !renderer.show_contour; }
         if window.consume_key(VK_P) {
             renderer.show_particles = !renderer.show_particles;
@@ -150,15 +185,14 @@ fn main() {
 }
 
 fn apply_preset(r: &mut VulkanRenderer, p: &Preset) {
-    r.components = p.components.clone();
-    r.max_density = p.max_density;
-    r.request_particle_reseed();
+    r.set_components(p.components.clone());
     println!("Preset: {}", p.name);
 }
 
 fn print_help() {
     println!(" Controls ");
-    println!("1..9       : preset orbital / superposition");
+    println!("1..9, 0    : preset orbital / superposition");
+    println!("K          : toggle real / complex angular basis");
     println!("+ / -      : faster / slower simulation time");
     println!("Space      : toggle auto-orbit camera");
     println!("LMB drag   : rotate camera");
@@ -166,6 +200,7 @@ fn print_help() {
     println!("V          : toggle Volume / Heatmap view");
     println!("S          : cycle slice axis (XY / XZ / YZ)  [heatmap]");
     println!("C          : cycle color mode (density / real / phase) [heatmap]");
+    println!("G          : cycle scale mode (linear / log / power) [heatmap]");
     println!("X          : toggle zero-contour overlay [heatmap, real mode]");
     println!("Left/Right : scrub slice depth [heatmap]");
     println!("T          : toggle mipmap empty-space skip (perf)");

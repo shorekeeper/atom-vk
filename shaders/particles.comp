@@ -23,6 +23,10 @@ layout(set = 0, binding = 0, std430) buffer Particles {
 
 layout(set = 0, binding = 1) uniform sampler3D psiTex;
 
+layout(set = 0, binding = 2, std430) readonly buffer DensityMaximum {
+    uint maximumDensityBits;
+};
+
 layout(push_constant) uniform PC {
     float halfExtent;     // domain half size in Bohr
     float maxDensity;     // upper bound on |psi|^2 used by rejection sampler
@@ -57,10 +61,15 @@ float density_at(vec3 worldPos) {
     return dot(psi, psi);
 }
 
+float maximum_density() {
+    return max(uintBitsToFloat(maximumDensityBits), 1e-30);
+}
+
 // Try at most N attempts to find a position whose density passes the
 // rejection test. Returns vec4(pos, 1.0) on success, vec4(0,0,0, -1) on
 // failure so the caller can mark the particle as a placeholder.
 vec4 rejection_sample(inout uint rng) {
+    float densityMaximum = maximum_density();
     for (int tries = 0; tries < 64; ++tries) {
         vec3 pos = vec3(
             (rnd(rng) * 2.0 - 1.0) * pc.halfExtent,
@@ -68,7 +77,7 @@ vec4 rejection_sample(inout uint rng) {
             (rnd(rng) * 2.0 - 1.0) * pc.halfExtent
         );
         float d = density_at(pos);
-        if (rnd(rng) * pc.maxDensity < d) {
+        if (rnd(rng) * densityMaximum < d) {
             return vec4(pos, 1.0);
         }
     }
@@ -95,7 +104,7 @@ void main() {
 
     // Re-seed dead or extremely-low-density particles so the cloud stays
     // populated as the wavefunction evolves.
-    if (age < 0.0 || density_at(p) < pc.maxDensity * 1e-4) {
+    if (age < 0.0 || density_at(p) < maximum_density() * 1e-4) {
         particles[id].pos_age = rejection_sample(rng);
         return;
     }

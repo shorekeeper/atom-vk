@@ -32,6 +32,9 @@ layout(set = 0, binding = 1) uniform Camera {
     // z = colorMode (0=density, 1=real, 2=phase)
     // w = contourFlag (>0.5 enables zero-contour overlay)
     vec4  heatmapParams;
+    // x = volume mip skip, y = coarse grid size
+    // z = heatmap scale mode, w = viewport aspect ratio
+    vec4  perfParams;
 } cam;
 
 // Polynomial viridis approximation. Sequential, perceptually uniform; used
@@ -77,28 +80,47 @@ vec2 samplePsi(vec3 worldPos) {
     return texture(psiTex, uvw).rg;
 }
 
-// Reduce a complex psi value to the scalar selected by colorMode.
-// Returns (value, normalized_value_for_colormap).
-void valueAndNorm(vec2 psi, int mode, out float v, out float n) {
-    float maxDensity = cam.domainParams.y;
-    if (mode == 0) {
-        // density |psi|^2; normalize logarithmically because hydrogenic
-        // densities span many orders of magnitude.
-        v = dot(psi, psi);
-        float logMax = log(maxDensity + 1e-30);
-        float logMin = logMax - 8.0;            // 8 decades of dynamic range
-        float lv = log(v + 1e-30);
-        n = clamp((lv - logMin) / (logMax - logMin), 0.0, 1.0);
-    } else if (mode == 1) {
-        // Re(psi) signed.
-        v = psi.x;
-        float a = sqrt(maxDensity);             // amplitude scale
-        n = clamp(v / a, -1.0, 1.0);
-    } else {
-        // Phase arg(psi) in [-pi, pi], mapped to [0, 1] for hue.
-        v = (dot(psi, psi) > 1e-12) ? atan(psi.y, psi.x) : 0.0;
-        n = (v + PI) / (2.0 * PI);
+// Applies the selected scale to a non-negative normalized value.
+float scaleUnsigned(float value, int scaleMode) {
+    float x = max(value, 0.0);
+    if (scaleMode == 0) return clamp(x, 0.0, 1.0);
+    if (scaleMode == 1) {
+        const float decades = 8.0;
+        float logValue = log(max(x, 1e-30)) / log(10.0);
+        return clamp((logValue + decades) / decades, 0.0, 1.0);
     }
+    return pow(clamp(x, 0.0, 1.0), max(cam.renderParams.w, 1e-4));
+}
+
+// Applies the selected scale while preserving the sign.
+float scaleSigned(float value, int scaleMode) {
+    float magnitude = abs(value);
+    float scaled = scaleUnsigned(magnitude, scaleMode);
+    return value < 0.0 ? -scaled : scaled;
+}
+
+// Reduces a complex sample to the selected scalar and colormap coordinate.
+void valueAndNorm(vec2 psi, int mode, int scaleMode,
+                  out float value, out float normalized) {
+    float maxDensity = max(cam.domainParams.y, 1e-30);
+    if (mode == 0) {
+        value = dot(psi, psi);
+        normalized = scaleUnsigned(value / maxDensity, scaleMode);
+    } else if (mode == 1) {
+        value = psi.x;
+        normalized = scaleSigned(
+            value / sqrt(maxDensity), scaleMode);
+    } else {
+        float density = dot(psi, psi);
+        value = density > 1e-20 ? atan(psi.y, psi.x) : 0.0;
+        normalized = (value + PI) / (2.0 * PI);
+    }
+}
+
+vec3 legendColor(float t, int colorMode) {
+    if (colorMode == 0) return viridis(t);
+    if (colorMode == 1) return coolwarm(t * 2.0 - 1.0);
+    return hsv2rgb(vec3(t, 0.85, 1.0));
 }
 
 void main() {
@@ -106,12 +128,17 @@ void main() {
     float offset  = cam.heatmapParams.y;
     int colorMode = int(cam.heatmapParams.z + 0.5);
     bool showCont = cam.heatmapParams.w > 0.5;
-    float h       = cam.domainParams.x;
+    int scaleMode = int(cam.perfParams.z + 0.5);
+    float h = cam.domainParams.x;
+    float aspect = max(cam.perfParams.w, 1e-6);
 
-    // Square viewport mapping: keep the slice plane undistorted.
-    // The triangle covers full screen; we letterbox by checking aspect.
-    // Compute world-space position of this fragment on the slice plane.
-    vec2 sliceCoord = ndc * h;  // map [-1,1] -> [-h, h]
+    // Preserve equal world-space scale along both displayed axes.
+    vec2 sliceNdc = ndc;
+    if (aspect >= 1.0) sliceNdc.x *= aspect;
+    else sliceNdc.y /= aspect;
+    bool insideSlice = all(lessThanEqual(abs(sliceNdc), vec2(1.0)));
+    vec2 sliceCoord = sliceNdc * h;
+
     vec3 worldPos;
     if (axis == 0) {
         // XY plane, slice offset along Z.
@@ -124,9 +151,9 @@ void main() {
         worldPos = vec3(offset * h, sliceCoord.x, sliceCoord.y);
     }
 
-    vec2 psi = samplePsi(worldPos);
+    vec2 psi = insideSlice ? samplePsi(worldPos) : vec2(0.0);
     float v, nrm;
-    valueAndNorm(psi, colorMode, v, nrm);
+    valueAndNorm(psi, colorMode, scaleMode, v, nrm);
 
     vec3 color;
     if (colorMode == 0) {
@@ -147,7 +174,7 @@ void main() {
 
     // Optional zero-contour overlay. Detect sign change of Re(psi) by
     // sampling four nearest neighbours and drawing a thin antialiased line.
-    if (showCont && colorMode == 1) {
+    if (insideSlice && showCont && colorMode == 1) {
         float voxel = cam.domainParams.z;
         vec3 dxv, dyv;
         if (axis == 0)      { dxv = vec3(voxel, 0, 0); dyv = vec3(0, voxel, 0); }
@@ -162,16 +189,40 @@ void main() {
         float gmag = length(grad);
         if (gmag > 1e-6) {
             float dist = abs(v0) / gmag;
-            float aa   = smoothstep(1.5, 0.0, dist);
-            color = mix(color, vec3(0.0, 0.0, 0.0), aa * 0.85);
+            float aa = 1.0 - smoothstep(0.0, 1.5, dist);
+            color = mix(color, vec3(0.0), aa * 0.85);
         }
     }
 
-    // Draw axis crosshair through the nucleus for spatial reference.
-    float pixToWorld = 2.0 * h / 720.0;        // approximate
-    float axisDist = min(abs(sliceCoord.x), abs(sliceCoord.y));
-    if (axisDist < pixToWorld * 0.5) {
-        color = mix(color, vec3(0.4, 0.4, 0.4), 0.6);
+    // Draw axes through the nucleus using screen-space derivatives.
+    if (insideSlice) {
+        float lineWidth = max(
+            fwidth(sliceCoord.x), fwidth(sliceCoord.y)) * 0.65;
+        float axisDist = min(abs(sliceCoord.x), abs(sliceCoord.y));
+        float axisAlpha = 1.0 - smoothstep(
+            lineWidth * 0.5, lineWidth * 1.5, axisDist);
+        color = mix(color, vec3(0.4), axisAlpha * 0.6);
+    } else {
+        color = vec3(0.0);
+    }
+
+    // Draw the active colormap in normalized device coordinates.
+    vec2 legendMin = vec2(0.84, -0.72);
+    vec2 legendMax = vec2(0.91,  0.72);
+    vec2 innerMin = vec2(0.85, -0.70);
+    vec2 innerMax = vec2(0.90,  0.70);
+    bool inLegend = all(greaterThanEqual(ndc, legendMin)) &&
+                    all(lessThanEqual(ndc, legendMax));
+    bool inLegendInner = all(greaterThanEqual(ndc, innerMin)) &&
+                         all(lessThanEqual(ndc, innerMax));
+    if (inLegend) {
+        color = vec3(0.55);
+        if (inLegendInner) {
+            float t = clamp(
+                (ndc.y - innerMin.y) / (innerMax.y - innerMin.y),
+                0.0, 1.0);
+            color = legendColor(t, colorMode);
+        }
     }
 
     outColor = vec4(color, 1.0);

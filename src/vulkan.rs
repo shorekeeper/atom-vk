@@ -10,6 +10,7 @@ use crate::win32::Window;
 
 const COMP_SPV:           &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wavefunction.comp.spv"));
 const MIPMAP_COMP_SPV:    &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mipmap.comp.spv"));
+const DIAGNOSTICS_COMP_SPV:&[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/diagnostics.comp.spv"));
 const VERT_SPV:           &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/raymarch.vert.spv"));
 const FRAG_SPV:           &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/raymarch.frag.spv"));
 const HEATMAP_VERT_SPV:   &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heatmap.vert.spv"));
@@ -30,6 +31,11 @@ pub const GRID_SIZE:        u32 = 128;
 pub const COARSE_GRID_SIZE: u32 = 16;
 pub const COARSE_BLOCK:     u32 = GRID_SIZE / COARSE_GRID_SIZE; // 8
 pub const HALF_EXTENT:      f32 = 20.0;
+pub const DIAGNOSTIC_GROUP_SIZE: u32 = 8;
+pub const DIAGNOSTIC_GROUPS_AXIS: u32 =
+    (GRID_SIZE + DIAGNOSTIC_GROUP_SIZE - 1) / DIAGNOSTIC_GROUP_SIZE;
+pub const DIAGNOSTIC_PARTIAL_COUNT: u32 =
+    DIAGNOSTIC_GROUPS_AXIS * DIAGNOSTIC_GROUPS_AXIS * DIAGNOSTIC_GROUPS_AXIS;
 pub const FRAMES_IN_FLIGHT: usize = 2;
 pub const MAX_COMPONENTS:   usize = 8;
 pub const PARTICLE_COUNT:   u32 = 32_768;
@@ -45,6 +51,14 @@ pub const ATLAS_W:        u32 = GLYPH_W * ATLAS_COLS; // 128
 pub const ATLAS_H:        u32 = GLYPH_H * ATLAS_ROWS; // 128
 pub const MAX_TEXT_QUADS: u32 = 1024;
 
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum AngularBasis {
+    #[default]
+    Real = 0,
+    Complex = 1,
+}
+
 // One eigenstate term in the superposition psi = sum_k c_k psi_nlm_k exp(-i E_k t).
 #[derive(Clone, Copy, Default)]
 pub struct OrbitalComponent {
@@ -55,6 +69,7 @@ pub struct OrbitalComponent {
     pub c_real: f32,
     pub c_imag: f32,
     pub energy: f32,
+    pub basis: AngularBasis,
 }
 
 // std140 layout matches the GLSL "Components" uniform block.
@@ -89,6 +104,21 @@ struct MipmapPC {
     coarse_grid_size: i32,
     block_size:       i32,
     _pad:             i32,
+}
+
+#[repr(C)]
+struct DiagnosticsPC {
+    grid_size:  i32,
+    half_extent:f32,
+    _pad0:      i32,
+    _pad1:      i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DiagnosticPartial {
+    moments:    [f32; 4],
+    radial_max: [f32; 4],
 }
 
 // Push constants for the particle compute shader.
@@ -157,6 +187,9 @@ pub enum SliceAxis { XY = 0, XZ = 1, YZ = 2 }
 
 #[derive(Clone, Copy)]
 pub enum ColorMode { Density = 0, Real = 1, Phase = 2 }
+
+#[derive(Clone, Copy)]
+pub enum HeatmapScale { Linear = 0, Log = 1, Power = 2 }
 
 // Vendor name lookup for the overlay and startup log. Matches standard
 // PCI vendor IDs reported by Vulkan device properties.
@@ -238,9 +271,19 @@ struct FrameData {
     psi_max_memory: vk::DeviceMemory,
     psi_max_view:   vk::ImageView,
 
-    compute_set:  vk::DescriptorSet,     // wavefunction.comp
-    mipmap_set:   vk::DescriptorSet,     // mipmap.comp
-    graphics_set: vk::DescriptorSet,     // raymarch / heatmap fragment
+    compute_set:     vk::DescriptorSet,  // wavefunction.comp
+    mipmap_set:      vk::DescriptorSet,  // mipmap.comp
+    diagnostics_set: vk::DescriptorSet,  // diagnostics.comp
+    graphics_set:    vk::DescriptorSet,  // raymarch / heatmap fragment
+
+    diagnostics_buffer: vk::Buffer,
+    diagnostics_memory: vk::DeviceMemory,
+    diagnostics_mapped: *mut DiagnosticPartial,
+
+    density_max_buffer: vk::Buffer,
+    density_max_memory: vk::DeviceMemory,
+    density_max_mapped: *mut u32,
+    diagnostics_revision: u64,
 
     // Becomes true after the first compute submission for this frame
     // slot so subsequent layout transitions can use the correct old
@@ -278,6 +321,10 @@ pub struct VulkanRenderer {
     mipmap_pipeline_layout: vk::PipelineLayout,
     mipmap_pipeline:        vk::Pipeline,
 
+    diagnostics_set_layout:      vk::DescriptorSetLayout,
+    diagnostics_pipeline_layout: vk::PipelineLayout,
+    diagnostics_pipeline:        vk::Pipeline,
+
     graphics_set_layout:     vk::DescriptorSetLayout,
     graphics_pipeline_layout:vk::PipelineLayout,
     graphics_pipeline:       vk::Pipeline,
@@ -288,9 +335,11 @@ pub struct VulkanRenderer {
 
     async_compute: Option<AsyncCompute>,
 
-    pub components:   Vec<OrbitalComponent>,
-    pub time_scale:   f32,
-    pub max_density:  f32,
+    pub components: Vec<OrbitalComponent>,
+    pub time_scale: f32,
+    max_density: f32,
+    density_scale_valid: bool,
+    wavefunction_revision: u64,
 
     pub cam_yaw:    f32,
     pub cam_pitch:  f32,
@@ -298,10 +347,11 @@ pub struct VulkanRenderer {
     pub auto_orbit: bool,
 
     pub view_mode:    ViewMode,
-    pub slice_axis:   SliceAxis,
-    pub slice_offset: f32,
-    pub color_mode:   ColorMode,
-    pub show_contour: bool,
+    pub slice_axis:    SliceAxis,
+    pub slice_offset:  f32,
+    pub color_mode:    ColorMode,
+    pub heatmap_scale: HeatmapScale,
+    pub show_contour:  bool,
 
     // Particle subsystem.
     particle_buffer:            vk::Buffer,
@@ -348,6 +398,11 @@ pub struct VulkanRenderer {
     fps_accum_frames: u32,
     fps_accum_start:  f32,
     fps_current:      f32,
+
+    diagnostic_norm:          f32,
+    diagnostic_max_density:   f32,
+    diagnostic_mean_radius:   f32,
+    diagnostic_mean_position: [f32; 3],
 
     // Visibility flags.
     pub show_volume:    bool,
@@ -544,7 +599,7 @@ impl VulkanRenderer {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
-                    descriptor_count: 6,
+                    descriptor_count: 8,
                 },
             ];
             let descriptor_pool = device.create_descriptor_pool(
@@ -633,6 +688,52 @@ impl VulkanRenderer {
             ).unwrap()[0];
             device.destroy_shader_module(mip_module, None);
 
+            // Wavefunction diagnostics reduction pipeline.
+
+            let diagnostics_bindings = [
+                vk::DescriptorSetLayoutBinding::default().binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default().binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default().binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            ];
+            let diagnostics_set_layout = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .bindings(&diagnostics_bindings),
+                None,
+            ).unwrap();
+            let diagnostics_layouts = [diagnostics_set_layout];
+            let diagnostics_pc_range = [vk::PushConstantRange {
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                offset: 0,
+                size: size_of::<DiagnosticsPC>() as u32,
+            }];
+            let diagnostics_pipeline_layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&diagnostics_layouts)
+                    .push_constant_ranges(&diagnostics_pc_range),
+                None,
+            ).unwrap();
+            let diagnostics_module = create_shader_module(
+                &device, DIAGNOSTICS_COMP_SPV);
+            let diagnostics_pipeline = device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::COMPUTE)
+                        .module(diagnostics_module).name(&entry_name))
+                    .layout(diagnostics_pipeline_layout)],
+                None,
+            ).unwrap()[0];
+            device.destroy_shader_module(diagnostics_module, None);
+
             
             // Volume + heatmap graphics pipelines.
             // Binding 2 (psi_max sampler) is declared in the shared set
@@ -678,6 +779,12 @@ impl VulkanRenderer {
             // Per-frame resources (cmd buffer, fence/sems, UBOs, volume,
             // psi_max image, descriptor sets for compute/mipmap/graphics)
             
+            let diagnostics_families = match caps.async_compute_family {
+                Some(family) if family != caps.graphics_family =>
+                    vec![caps.graphics_family, family],
+                _ => vec![caps.graphics_family],
+            };
+
             let mut frames = Vec::with_capacity(FRAMES_IN_FLIGHT);
             for _ in 0..FRAMES_IN_FLIGHT {
                 let cmd_pool = device.create_command_pool(
@@ -713,6 +820,22 @@ impl VulkanRenderer {
                     create_volume_3d(&instance, &device, physical_device,
                                      COARSE_GRID_SIZE, vk::Format::R32_SFLOAT);
 
+                let diagnostics_size = DIAGNOSTIC_PARTIAL_COUNT as u64
+                    * size_of::<DiagnosticPartial>() as u64;
+                let (diagnostics_buffer, diagnostics_memory, diagnostics_raw) =
+                    create_host_storage_buffer_shared(
+                        &instance, &device, physical_device,
+                        diagnostics_size, &diagnostics_families);
+                let diagnostics_mapped =
+                    diagnostics_raw as *mut DiagnosticPartial;
+                let (density_max_buffer, density_max_memory, density_max_raw) =
+                    create_host_storage_buffer_shared_usage(
+                        &instance, &device, physical_device, 4,
+                        vk::BufferUsageFlags::STORAGE_BUFFER |
+                        vk::BufferUsageFlags::TRANSFER_DST,
+                        &diagnostics_families);
+                let density_max_mapped = density_max_raw as *mut u32;
+
                 let set_layouts_compute = [compute_set_layout];
                 let compute_set = device.allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
@@ -725,6 +848,13 @@ impl VulkanRenderer {
                     &vk::DescriptorSetAllocateInfo::default()
                         .descriptor_pool(descriptor_pool)
                         .set_layouts(&set_layouts_mip),
+                ).unwrap()[0];
+
+                let set_layouts_diagnostics = [diagnostics_set_layout];
+                let diagnostics_set = device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(descriptor_pool)
+                        .set_layouts(&set_layouts_diagnostics),
                 ).unwrap()[0];
 
                 let set_layouts_gfx = [graphics_set_layout];
@@ -753,6 +883,21 @@ impl VulkanRenderer {
                     sampler: vk::Sampler::null(),
                     image_view: psi_max_view,
                     image_layout: vk::ImageLayout::GENERAL,
+                }];
+                let diagnostics_src = [vk::DescriptorImageInfo {
+                    sampler: volume_sampler,
+                    image_view: volume_view,
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                }];
+                let diagnostics_dst = [vk::DescriptorBufferInfo {
+                    buffer: diagnostics_buffer,
+                    offset: 0,
+                    range: diagnostics_size,
+                }];
+                let diagnostics_max = [vk::DescriptorBufferInfo {
+                    buffer: density_max_buffer,
+                    offset: 0,
+                    range: 4,
                 }];
                 let gfx_vol = [vk::DescriptorImageInfo {
                     sampler: volume_sampler,
@@ -787,6 +932,18 @@ impl VulkanRenderer {
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(&mip_dst),
                     vk::WriteDescriptorSet::default()
+                        .dst_set(diagnostics_set).dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&diagnostics_src),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(diagnostics_set).dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&diagnostics_dst),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(diagnostics_set).dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&diagnostics_max),
+                    vk::WriteDescriptorSet::default()
                         .dst_set(graphics_set).dst_binding(0)
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                         .image_info(&gfx_vol),
@@ -807,7 +964,10 @@ impl VulkanRenderer {
                     components_buffer, components_memory, components_mapped,
                     volume_image, volume_memory, volume_view,
                     psi_max_image, psi_max_memory, psi_max_view,
-                    compute_set, mipmap_set, graphics_set,
+                    compute_set, mipmap_set, diagnostics_set, graphics_set,
+                    diagnostics_buffer, diagnostics_memory, diagnostics_mapped,
+                    density_max_buffer, density_max_memory, density_max_mapped,
+                    diagnostics_revision: 0,
                     initialized: false,
                 });
             }
@@ -839,6 +999,9 @@ impl VulkanRenderer {
                     .stage_flags(vk::ShaderStageFlags::COMPUTE),
                 vk::DescriptorSetLayoutBinding::default().binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default().binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::COMPUTE),
             ];
             let particles_set_layout = device.create_descriptor_set_layout(
@@ -921,6 +1084,11 @@ impl VulkanRenderer {
                 buffer: frames[0].camera_buffer, offset: 0,
                 range: size_of::<CameraUBO>() as u64,
             }];
+            let p_max = [vk::DescriptorBufferInfo {
+                buffer: frames[0].density_max_buffer,
+                offset: 0,
+                range: 4,
+            }];
             device.update_descriptor_sets(&[
                 vk::WriteDescriptorSet::default()
                     .dst_set(particles_set).dst_binding(0)
@@ -930,6 +1098,10 @@ impl VulkanRenderer {
                     .dst_set(particles_set).dst_binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&p_img),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(particles_set).dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&p_max),
                 vk::WriteDescriptorSet::default()
                     .dst_set(particles_gfx_set).dst_binding(0)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -1094,6 +1266,8 @@ impl VulkanRenderer {
                 descriptor_pool,
                 compute_set_layout, compute_pipeline_layout, compute_pipeline,
                 mipmap_set_layout, mipmap_pipeline_layout, mipmap_pipeline,
+                diagnostics_set_layout, diagnostics_pipeline_layout,
+                diagnostics_pipeline,
                 graphics_set_layout, graphics_pipeline_layout,
                 graphics_pipeline, heatmap_pipeline,
                 frames, frame_index: 0,
@@ -1101,7 +1275,9 @@ impl VulkanRenderer {
 
                 components: Vec::new(),
                 time_scale: 3.0,
-                max_density: 0.05,
+                max_density: 1.0,
+                density_scale_valid: false,
+                wavefunction_revision: 0,
 
                 cam_yaw:    0.6,
                 cam_pitch:  0.45,
@@ -1109,10 +1285,11 @@ impl VulkanRenderer {
                 auto_orbit: true,
 
                 view_mode:    ViewMode::Volume,
-                slice_axis:   SliceAxis::XZ,
-                slice_offset: 0.0,
-                color_mode:   ColorMode::Real,
-                show_contour: true,
+                slice_axis:    SliceAxis::XZ,
+                slice_offset:  0.0,
+                color_mode:    ColorMode::Real,
+                heatmap_scale: HeatmapScale::Linear,
+                show_contour:  true,
 
                 particle_buffer, particle_memory,
                 particles_set_layout, particles_set,
@@ -1136,6 +1313,11 @@ impl VulkanRenderer {
                 fps_accum_frames: 0,
                 fps_accum_start:  0.0,
                 fps_current:      0.0,
+
+                diagnostic_norm:          0.0,
+                diagnostic_max_density:   0.0,
+                diagnostic_mean_radius:   0.0,
+                diagnostic_mean_position: [0.0; 3],
 
                 show_volume: true,
                 show_particles: false,
@@ -1176,6 +1358,7 @@ impl VulkanRenderer {
             let psi_max_image    = self.frames[frame_idx].psi_max_image;
             let compute_set      = self.frames[frame_idx].compute_set;
             let mipmap_set       = self.frames[frame_idx].mipmap_set;
+            let diagnostics_set  = self.frames[frame_idx].diagnostics_set;
             let graphics_set     = self.frames[frame_idx].graphics_set;
             let was_init         = self.frames[frame_idx].initialized;
 
@@ -1183,6 +1366,7 @@ impl VulkanRenderer {
             // Frame setup: wait, acquire, reset
             
             self.device.wait_for_fences(&[in_flight_fence], true, u64::MAX).unwrap();
+            self.read_diagnostics(frame_idx);
             let (image_index, _) = match self.swapchain_loader.acquire_next_image(
                 self.swapchain, u64::MAX, image_available, vk::Fence::null(),
             ) {
@@ -1198,6 +1382,8 @@ impl VulkanRenderer {
             let atomic_time = time_seconds * self.time_scale;
             self.write_components_ubo(&self.frames[frame_idx], atomic_time);
             self.write_camera_ubo(&self.frames[frame_idx], time_seconds);
+            self.frames[frame_idx].diagnostics_revision =
+                self.wavefunction_revision;
 
             let dt = (time_seconds - self.last_frame_time).clamp(0.0, 0.05);
             self.last_frame_time = time_seconds;
@@ -1239,6 +1425,10 @@ impl VulkanRenderer {
                     volume_image, psi_max_image,
                     self.compute_pipeline, self.compute_pipeline_layout, compute_set,
                     self.mipmap_pipeline, self.mipmap_pipeline_layout, mipmap_set,
+                    self.diagnostics_pipeline,
+                    self.diagnostics_pipeline_layout, diagnostics_set,
+                    self.frames[frame_idx].diagnostics_buffer,
+                    self.frames[frame_idx].density_max_buffer,
                     was_init,
                     // Release to graphics family if different.
                     if gf != acf { Some((acf, gf)) } else { None },
@@ -1286,6 +1476,10 @@ impl VulkanRenderer {
                     volume_image, psi_max_image,
                     self.compute_pipeline, self.compute_pipeline_layout, compute_set,
                     self.mipmap_pipeline, self.mipmap_pipeline_layout, mipmap_set,
+                    self.diagnostics_pipeline,
+                    self.diagnostics_pipeline_layout, diagnostics_set,
+                    self.frames[frame_idx].diagnostics_buffer,
+                    self.frames[frame_idx].density_max_buffer,
                     was_init,
                     None,
                 );
@@ -1311,7 +1505,8 @@ impl VulkanRenderer {
             // Particles compute pass (still inline on graphics queue to
             // avoid doubling the SSBO ownership-transfer dance).
             
-            let do_particles = self.show_particles && frame_idx == 0;
+            let do_particles =
+                self.show_particles && self.density_scale_valid && frame_idx == 0;
             if do_particles {
                 self.frame_counter = self.frame_counter.wrapping_add(1);
                 let mode = if self.needs_particle_init { 0u32 } else { 1u32 };
@@ -1404,7 +1599,7 @@ impl VulkanRenderer {
             
             // Draw 1: fullscreen volume ray marcher OR heatmap
             
-            if self.show_volume {
+            if self.show_volume && self.density_scale_valid {
                 let pipeline = match self.view_mode {
                     ViewMode::Volume  => self.graphics_pipeline,
                     ViewMode::Heatmap => self.heatmap_pipeline,
@@ -1425,7 +1620,7 @@ impl VulkanRenderer {
             
             // Draw 2: particle billboards
             
-            if self.show_particles {
+            if self.show_particles && self.density_scale_valid {
                 let pc = GfxMatrixPC {
                     view, proj,
                     point_size: 0.18,
@@ -1521,8 +1716,7 @@ impl VulkanRenderer {
             if let Some(tv) = compute_timeline_value {
                 let ac = self.async_compute.as_ref().unwrap();
                 wait_sems.push(ac.timeline);
-                // Wait at the earliest stage that reads the volume/psi_max.
-                wait_stage.push(vk::PipelineStageFlags::FRAGMENT_SHADER);
+                wait_stage.push(vk::PipelineStageFlags::ALL_COMMANDS);
                 wait_vals.push(tv);
             }
             let signal_sems = [render_finished];
@@ -1578,24 +1772,68 @@ impl VulkanRenderer {
         }
     }
 
-    // Lays out three short diagnostic lines at the top-left of the screen:
-    // the FPS counter, the GPU name, and the active optimization flags.
+    // Lays out diagnostic lines at the top-left of the screen.
     // Returns the glyph-instance count for vkCmdDraw.
     fn build_overlay_text_quads(&mut self) -> u32 {
-        let fps_text   = format!("FPS: {:5.1}", self.fps_current);
-        let gpu_text   = format!("GPU: {} {}",
-                                  self.caps.vendor_str(),
-                                  truncate_str(&self.caps.device_name, 40));
-        let async_str  = if self.caps.has_async_compute() {
+        let fps_text = format!("FPS: {:5.1}", self.fps_current);
+        let gpu_text = format!("GPU: {} {}",
+                               self.caps.vendor_str(),
+                               truncate_str(&self.caps.device_name, 40));
+        let async_str = if self.caps.has_async_compute() {
             if self.perf_async { "ASYNC:ON " } else { "ASYNC:OFF" }
         } else { "ASYNC:N/A" };
-        let mip_str    = if self.perf_mipskip { "MIP:ON " } else { "MIP:OFF" };
-        let perf_text  = format!("{}  {}", async_str, mip_str);
+        let mip_str = if self.perf_mipskip { "MIP:ON " } else { "MIP:OFF" };
+        let perf_text = format!("{}  {}", async_str, mip_str);
+
+        let real_count = self.components.iter()
+            .filter(|c| c.basis == AngularBasis::Real).count();
+        let basis_name = if real_count == self.components.len() {
+            "REAL"
+        } else if real_count == 0 {
+            "COMPLEX"
+        } else {
+            "MIXED"
+        };
+        let basis_text = format!("BASIS: {}", basis_name);
+        let axis_name = match self.slice_axis {
+            SliceAxis::XY => "XY",
+            SliceAxis::XZ => "XZ",
+            SliceAxis::YZ => "YZ",
+        };
+        let color_name = match self.color_mode {
+            ColorMode::Density => "DENSITY",
+            ColorMode::Real => "REAL",
+            ColorMode::Phase => "PHASE",
+        };
+        let scale_name = match self.heatmap_scale {
+            HeatmapScale::Linear => "LINEAR",
+            HeatmapScale::Log => "LOG",
+            HeatmapScale::Power => "POWER",
+        };
+        let slice_text = format!(
+            "SLICE: {}  OFFSET: {:+.2} a0",
+            axis_name, self.slice_offset * HALF_EXTENT);
+        let heatmap_text = format!(
+            "COLOR: {}  SCALE: {}", color_name, scale_name);
+        let norm_text = format!(
+            "NORM: {:.6}  MAX RHO: {:.6e}",
+            self.diagnostic_norm, self.diagnostic_max_density);
+        let radius_text = format!(
+            "MEAN R: {:.4} a0", self.diagnostic_mean_radius);
+        let p = self.diagnostic_mean_position;
+        let position_text = format!(
+            "MEAN XYZ: {:+.4} {:+.4} {:+.4} a0", p[0], p[1], p[2]);
 
         let lines = [
-            (fps_text.as_str(),  [1.0f32, 1.0, 0.4, 1.0]),
-            (gpu_text.as_str(),  [0.7f32, 0.9, 1.0, 1.0]),
-            (perf_text.as_str(), [0.7f32, 1.0, 0.7, 1.0]),
+            (fps_text.as_str(),      [1.0f32, 1.0, 0.4, 1.0]),
+            (gpu_text.as_str(),      [0.7f32, 0.9, 1.0, 1.0]),
+            (perf_text.as_str(),     [0.7f32, 1.0, 0.7, 1.0]),
+            (basis_text.as_str(),    [1.0f32, 0.7, 1.0, 1.0]),
+            (slice_text.as_str(),    [0.7f32, 0.9, 1.0, 1.0]),
+            (heatmap_text.as_str(),  [0.7f32, 0.9, 1.0, 1.0]),
+            (norm_text.as_str(),     [1.0f32, 0.9, 0.7, 1.0]),
+            (radius_text.as_str(),   [1.0f32, 0.9, 0.7, 1.0]),
+            (position_text.as_str(), [1.0f32, 0.9, 0.7, 1.0]),
         ];
 
         let scale: f32 = 2.0;
@@ -1634,6 +1872,55 @@ impl VulkanRenderer {
         count
     }
 
+    fn read_diagnostics(&mut self, frame_idx: usize) {
+        let frame = &self.frames[frame_idx];
+        if !frame.initialized ||
+            frame.diagnostics_revision != self.wavefunction_revision {
+            return;
+        }
+
+        let maximum = unsafe {
+            f32::from_bits(ptr::read(frame.density_max_mapped))
+        };
+        if !maximum.is_finite() || maximum <= 0.0 { return; }
+
+        let partials = unsafe {
+            std::slice::from_raw_parts(
+                frame.diagnostics_mapped,
+                DIAGNOSTIC_PARTIAL_COUNT as usize,
+            )
+        };
+        let mut density = 0.0f64;
+        let mut radial = 0.0f64;
+        let mut moments = [0.0f64; 3];
+
+        for partial in partials {
+            density += partial.moments[0] as f64;
+            moments[0] += partial.moments[1] as f64;
+            moments[1] += partial.moments[2] as f64;
+            moments[2] += partial.moments[3] as f64;
+            radial += partial.radial_max[0] as f64;
+        }
+
+        let voxel = 2.0 * HALF_EXTENT as f64 / GRID_SIZE as f64;
+        self.diagnostic_norm = (density * voxel * voxel * voxel) as f32;
+        self.diagnostic_max_density = maximum;
+        self.max_density = maximum;
+        self.density_scale_valid = true;
+
+        if density > 1e-30 {
+            self.diagnostic_mean_radius = (radial / density) as f32;
+            self.diagnostic_mean_position = [
+                (moments[0] / density) as f32,
+                (moments[1] / density) as f32,
+                (moments[2] / density) as f32,
+            ];
+        } else {
+            self.diagnostic_mean_radius = 0.0;
+            self.diagnostic_mean_position = [0.0; 3];
+        }
+    }
+
     fn write_components_ubo(&self, frame: &FrameData, atomic_time: f32) {
         let mut ubo = ComponentsUBO {
             num_components: self.components.len() as i32,
@@ -1645,7 +1932,10 @@ impl VulkanRenderer {
         };
         for (i, c) in self.components.iter().take(MAX_COMPONENTS).enumerate() {
             ubo.nlm_z[i] = [c.n as f32, c.l as f32, c.m as f32, c.z];
-            ubo.amp[i]   = [c.c_real, c.c_imag, c.energy, 0.0];
+            ubo.amp[i] = [
+                c.c_real, c.c_imag, c.energy,
+                c.basis as u32 as f32,
+            ];
         }
         unsafe { ptr::write(frame.components_mapped, ubo); }
     }
@@ -1665,8 +1955,9 @@ impl VulkanRenderer {
         };
         let slice_axis_f = self.slice_axis as i32 as f32;
         let color_mode_f = self.color_mode as i32 as f32;
-        let contour_f    = if self.show_contour { 1.0 } else { 0.0 };
-        let mipskip_f    = if self.perf_mipskip { 1.0 } else { 0.0 };
+        let contour_f = if self.show_contour { 1.0 } else { 0.0 };
+        let mipskip_f = if self.perf_mipskip { 1.0 } else { 0.0 };
+        let heatmap_scale_f = self.heatmap_scale as i32 as f32;
 
         let ubo = CameraUBO {
             view_inv, proj_inv,
@@ -1674,7 +1965,12 @@ impl VulkanRenderer {
             domain_params:  [HALF_EXTENT, self.max_density, voxel_size, view_mode_f],
             render_params:  [0.10, 18.0, 0.02, 0.65],
             heatmap_params: [slice_axis_f, self.slice_offset, color_mode_f, contour_f],
-            perf_params:    [mipskip_f, COARSE_GRID_SIZE as f32, 0.0, 0.0],
+            perf_params: [
+                mipskip_f,
+                COARSE_GRID_SIZE as f32,
+                heatmap_scale_f,
+                aspect,
+            ],
         };
         unsafe { ptr::write(frame.camera_mapped, ubo); }
     }
@@ -1715,6 +2011,18 @@ impl VulkanRenderer {
         });
     }
 
+    pub fn set_components(&mut self, components: Vec<OrbitalComponent>) {
+        self.components = components;
+        self.wavefunction_revision = self.wavefunction_revision.wrapping_add(1);
+        self.max_density = 1.0;
+        self.density_scale_valid = false;
+        self.diagnostic_norm = 0.0;
+        self.diagnostic_max_density = 0.0;
+        self.diagnostic_mean_radius = 0.0;
+        self.diagnostic_mean_position = [0.0; 3];
+        self.request_particle_reseed();
+    }
+
     pub fn request_particle_reseed(&mut self) {
         self.needs_particle_init = true;
     }
@@ -1740,6 +2048,27 @@ impl VulkanRenderer {
             ColorMode::Real    => ColorMode::Phase,
             ColorMode::Phase   => ColorMode::Density,
         };
+    }
+
+    pub fn cycle_heatmap_scale(&mut self) {
+        self.heatmap_scale = match self.heatmap_scale {
+            HeatmapScale::Linear => HeatmapScale::Log,
+            HeatmapScale::Log => HeatmapScale::Power,
+            HeatmapScale::Power => HeatmapScale::Linear,
+        };
+    }
+
+    pub fn toggle_angular_basis(&mut self) {
+        for component in &mut self.components {
+            component.basis = match component.basis {
+                AngularBasis::Real => AngularBasis::Complex,
+                AngularBasis::Complex => AngularBasis::Real,
+            };
+        }
+        self.wavefunction_revision = self.wavefunction_revision.wrapping_add(1);
+        self.max_density = 1.0;
+        self.density_scale_valid = false;
+        self.request_particle_reseed();
     }
 
     pub fn nudge_slice(&mut self, delta: f32) {
@@ -1794,6 +2123,12 @@ impl Drop for VulkanRenderer {
                 self.device.destroy_image_view(f.psi_max_view, None);
                 self.device.destroy_image(f.psi_max_image, None);
                 self.device.free_memory(f.psi_max_memory, None);
+                self.device.unmap_memory(f.diagnostics_memory);
+                self.device.destroy_buffer(f.diagnostics_buffer, None);
+                self.device.free_memory(f.diagnostics_memory, None);
+                self.device.unmap_memory(f.density_max_memory);
+                self.device.destroy_buffer(f.density_max_buffer, None);
+                self.device.free_memory(f.density_max_memory, None);
                 self.device.destroy_fence(f.in_flight_fence, None);
                 self.device.destroy_semaphore(f.image_available, None);
                 self.device.destroy_semaphore(f.render_finished, None);
@@ -1810,6 +2145,11 @@ impl Drop for VulkanRenderer {
             self.device.destroy_pipeline(self.graphics_pipeline, None);
             self.device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
             self.device.destroy_descriptor_set_layout(self.graphics_set_layout, None);
+            self.device.destroy_pipeline(self.diagnostics_pipeline, None);
+            self.device.destroy_pipeline_layout(
+                self.diagnostics_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.diagnostics_set_layout, None);
             self.device.destroy_pipeline(self.mipmap_pipeline, None);
             self.device.destroy_pipeline_layout(self.mipmap_pipeline_layout, None);
             self.device.destroy_descriptor_set_layout(self.mipmap_set_layout, None);
@@ -1861,6 +2201,11 @@ unsafe fn record_compute_work(
     volume_image: vk::Image, psi_max_image: vk::Image,
     wf_pipe: vk::Pipeline, wf_layout: vk::PipelineLayout, wf_set: vk::DescriptorSet,
     mip_pipe: vk::Pipeline, mip_layout: vk::PipelineLayout, mip_set: vk::DescriptorSet,
+    diagnostics_pipe: vk::Pipeline,
+    diagnostics_layout: vk::PipelineLayout,
+    diagnostics_set: vk::DescriptorSet,
+    diagnostics_buffer: vk::Buffer,
+    density_max_buffer: vk::Buffer,
     was_init: bool,
     release_to: Option<(u32, u32)>,  // (src_family, dst_family)
 ) {
@@ -1927,6 +2272,65 @@ unsafe fn record_compute_work(
         vk::PipelineStageFlags::COMPUTE_SHADER,
         vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
     );
+
+    device.cmd_fill_buffer(cmd, density_max_buffer, 0, 4, 0);
+    let density_clear_barrier = vk::BufferMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .buffer(density_max_buffer).offset(0).size(4);
+    device.cmd_pipeline_barrier(
+        cmd,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::DependencyFlags::empty(),
+        &[], &[density_clear_barrier], &[]);
+
+    // Wavefunction diagnostics reduction.
+    let diagnostics_pc = DiagnosticsPC {
+        grid_size: GRID_SIZE as i32,
+        half_extent: HALF_EXTENT,
+        _pad0: 0,
+        _pad1: 0,
+    };
+    let diagnostics_pc_bytes = std::slice::from_raw_parts(
+        &diagnostics_pc as *const _ as *const u8,
+        size_of::<DiagnosticsPC>());
+    device.cmd_bind_pipeline(
+        cmd, vk::PipelineBindPoint::COMPUTE, diagnostics_pipe);
+    device.cmd_bind_descriptor_sets(
+        cmd, vk::PipelineBindPoint::COMPUTE,
+        diagnostics_layout, 0, &[diagnostics_set], &[]);
+    device.cmd_push_constants(
+        cmd, diagnostics_layout, vk::ShaderStageFlags::COMPUTE,
+        0, diagnostics_pc_bytes);
+    device.cmd_dispatch(
+        cmd, DIAGNOSTIC_GROUPS_AXIS,
+        DIAGNOSTIC_GROUPS_AXIS, DIAGNOSTIC_GROUPS_AXIS);
+
+    let diagnostics_barrier = vk::BufferMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        .dst_access_mask(vk::AccessFlags::HOST_READ)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .buffer(diagnostics_buffer)
+        .offset(0).size(vk::WHOLE_SIZE);
+    let density_max_barrier = vk::BufferMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        .dst_access_mask(
+            vk::AccessFlags::HOST_READ | vk::AccessFlags::SHADER_READ)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .buffer(density_max_buffer).offset(0).size(4);
+    device.cmd_pipeline_barrier(
+        cmd,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::PipelineStageFlags::HOST |
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::DependencyFlags::empty(),
+        &[], &[diagnostics_barrier, density_max_barrier], &[]);
 
     // If we are on a different queue family than the subsequent graphics
     // submission, release ownership here. The matching acquire will be
@@ -2311,6 +2715,46 @@ unsafe fn image_barrier(
     device.cmd_pipeline_barrier(
         cmd, src_stage, dst_stage, vk::DependencyFlags::empty(),
         &[], &[], &[barrier]);
+}
+
+unsafe fn create_host_storage_buffer_shared_usage(
+    instance: &Instance, device: &Device, pd: vk::PhysicalDevice,
+    size: u64, usage: vk::BufferUsageFlags, queue_families: &[u32],
+) -> (vk::Buffer, vk::DeviceMemory, *mut u8) {
+    let mut info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage);
+    if queue_families.len() > 1 {
+        info = info.sharing_mode(vk::SharingMode::CONCURRENT)
+            .queue_family_indices(queue_families);
+    } else {
+        info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+    }
+
+    let buf = device.create_buffer(&info, None).unwrap();
+    let req = device.get_buffer_memory_requirements(buf);
+    let mt = find_memory_type(instance, pd, req.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE |
+        vk::MemoryPropertyFlags::HOST_COHERENT);
+    let mem = device.allocate_memory(
+        &vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size).memory_type_index(mt),
+        None,
+    ).unwrap();
+    device.bind_buffer_memory(buf, mem, 0).unwrap();
+    let ptr = device.map_memory(
+        mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        .unwrap() as *mut u8;
+    (buf, mem, ptr)
+}
+
+unsafe fn create_host_storage_buffer_shared(
+    instance: &Instance, device: &Device, pd: vk::PhysicalDevice,
+    size: u64, queue_families: &[u32],
+) -> (vk::Buffer, vk::DeviceMemory, *mut u8) {
+    create_host_storage_buffer_shared_usage(
+        instance, device, pd, size,
+        vk::BufferUsageFlags::STORAGE_BUFFER, queue_families)
 }
 
 unsafe fn create_host_storage_buffer(

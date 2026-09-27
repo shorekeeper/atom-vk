@@ -1,0 +1,89 @@
+#version 460
+// Reduces wavefunction samples into per-workgroup diagnostic records.
+//
+// The output contains the density integral terms, first spatial moments,
+// radial moment, and maximum sampled density. Final reduction is performed
+// on the host after completion of the frame slot.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler3D psiTex;
+
+struct DiagnosticPartial {
+    vec4 moments;    // density sum, density*x, density*y, density*z
+    vec4 radialMax;  // density*r, maximum density, padding
+};
+
+layout(set = 0, binding = 1, std430) buffer Diagnostics {
+    DiagnosticPartial partials[];
+};
+
+layout(set = 0, binding = 2, std430) buffer DensityMaximum {
+    uint maximumDensityBits;
+};
+
+layout(push_constant) uniform PC {
+    int   gridSize;
+    float halfExtent;
+    int   _pad0;
+    int   _pad1;
+} pc;
+
+shared float densitySum[512];
+shared float momentX[512];
+shared float momentY[512];
+shared float momentZ[512];
+shared float radialSum[512];
+shared float densityMax[512];
+
+void main() {
+    uint localIndex = gl_LocalInvocationIndex;
+    ivec3 idx = ivec3(gl_GlobalInvocationID);
+    bool valid = all(lessThan(idx, ivec3(pc.gridSize)));
+
+    float density = 0.0;
+    vec3 pos = vec3(0.0);
+    if (valid) {
+        vec2 psi = texelFetch(psiTex, idx, 0).rg;
+        density = dot(psi, psi);
+        vec3 voxel = vec3(idx) + vec3(0.5);
+        pos = voxel / float(pc.gridSize) * (2.0 * pc.halfExtent)
+            - vec3(pc.halfExtent);
+    }
+
+    densitySum[localIndex] = density;
+    momentX[localIndex] = density * pos.x;
+    momentY[localIndex] = density * pos.y;
+    momentZ[localIndex] = density * pos.z;
+    radialSum[localIndex] = density * length(pos);
+    densityMax[localIndex] = density;
+    barrier();
+
+    for (uint stride = 256; stride > 0; stride >>= 1) {
+        if (localIndex < stride) {
+            densitySum[localIndex] += densitySum[localIndex + stride];
+            momentX[localIndex] += momentX[localIndex + stride];
+            momentY[localIndex] += momentY[localIndex + stride];
+            momentZ[localIndex] += momentZ[localIndex + stride];
+            radialSum[localIndex] += radialSum[localIndex + stride];
+            densityMax[localIndex] = max(
+                densityMax[localIndex],
+                densityMax[localIndex + stride]
+            );
+        }
+        barrier();
+    }
+
+    if (localIndex == 0) {
+        uint groupIndex = gl_WorkGroupID.x + gl_NumWorkGroups.x * (
+            gl_WorkGroupID.y + gl_NumWorkGroups.y * gl_WorkGroupID.z
+        );
+        partials[groupIndex].moments = vec4(
+            densitySum[0], momentX[0], momentY[0], momentZ[0]
+        );
+        partials[groupIndex].radialMax = vec4(
+            radialSum[0], densityMax[0], 0.0, 0.0
+        );
+        atomicMax(maximumDensityBits, floatBitsToUint(densityMax[0]));
+    }
+}

@@ -30,6 +30,7 @@ fn main() {
         ("text.frag",         "text.frag.spv"),
         ("text.vert",         "text.vert.spv"),
         ("mipmap.comp",       "mipmap.comp.spv"),
+        ("diagnostics.comp",  "diagnostics.comp.spv"),
     ];
 
     for (src, dst) in shaders.iter() {
